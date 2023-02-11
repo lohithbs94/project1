@@ -13,7 +13,7 @@ jobs:
       if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'master'
       env:
         JENKINS_URL: http://13.126.21.185:8080/
-        JENKINS_JOB_NAME: Declarative_pipeline_job
+        JENKINS_JOB_NAME: Test-1
         JENKINS_AUTH: ${{ secrets.JENKINS_AUTH }}
 
     - name: Trigger Jenkins Job
