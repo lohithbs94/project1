@@ -23,4 +23,3 @@ jobs:
           sh -c "curl -X POST ${JENKINS_URL}/job/${JENKINS_JOB_NAME}/build \
           --user ${JENKINS_AUTH} \
           --data-urlencode json='{\"parameter\":[{\"name\":\"branch\", \"value\":\"${{ github.ref }}\"}]}'"
-
