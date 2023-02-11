@@ -1,0 +1,25 @@
+name: Jenkins Job Trigger on Pull Request Merge
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check if PR is merged to master
+      if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'master'
+      env:
+        JENKINS_URL: http://13.126.21.185:8080/
+        JENKINS_JOB_NAME: Declarative_pipeline_job
+        JENKINS_AUTH: ${{ secrets.JENKINS_AUTH }}
+
+    - name: Trigger Jenkins Job
+      uses: docker://alpine/curl
+      with:
+        args: |
+          sh -c "curl -X POST ${JENKINS_URL}/job/${JENKINS_JOB_NAME}/build \
+          --user ${JENKINS_AUTH} \
+          --data-urlencode json='{\"parameter\":[{\"name\":\"branch\", \"value\":\"${{ github.ref }}\"}]}'"
