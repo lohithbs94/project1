@@ -23,3 +23,18 @@ jobs:
           sh -c "curl -X POST ${JENKINS_URL}/job/${JENKINS_JOB_NAME}/build \
           --user ${JENKINS_AUTH} \
           --data-urlencode json='{\"parameter\":[{\"name\":\"branch\", \"value\":\"${{ github.ref }}\"}]}'"
+          
+          - name: Trigger Jenkins Job
+  uses: docker://alpine/curl
+  with:
+    args: |
+      sh -c "curl -X POST ${JENKINS_URL}/job/${JENKINS_JOB_NAME}/build \
+      --user ${JENKINS_AUTH} \
+      --data-urlencode json='{\"parameter\":[{\"name\":\"branch\", \"value\":\"${{ github.ref }}\"}]}' \
+      -o jenkins_response.txt"
+
+- name: Debug Jenkins API Response
+  run: |
+    echo "Jenkins API Response:"
+    cat jenkins_response.txt
+
