@@ -1,0 +1,616 @@
+import groovy.json.JsonSlurper
+
+def getJobStatus(String jobName){
+    def request = httpRequest authentication: 'JenkinsCred', url: "http://awnwcloudp2.na.ad.whirlpool.com:8080/job/${jobName}/lastBuild/api/json"
+    def requestJson = new JsonSlurper().parseText(request.getContent())
+    return requestJson['result']
+}
+
+def update_no_change = "No updates are to be performed"
+def git_credential='GitHub_1'
+def config_file = "config/${ENV_STAGE}-config.txt"
+def msk_config_file = "msk/values-key-${ENV_STAGE}.yaml"
+def projectconfig_file = "config/projectProperties.txt"
+def tag = "${REPO_TAG}"
+def gitRepoFullURL = "${GITREPO_TO_BUILD}"
+
+def jenkinsRoleArn
+def serviceVersion
+def gvInfra
+
+def dr_event = env.DR_EVENT && (DR_EVENT == "true")
+def buildResult = getJobStatus("${JOB_TO_MONITOR}")
+
+pipeline {
+    agent any
+    stages {
+
+	stage("Check Environment") {
+	    steps {
+                script {
+			def restrictedEnv = "${RESTRICTED_DEPLOY_ENV}"
+			if (restrictedEnv.contains("${ENV_STAGE}")){
+				withCredentials([usernamePassword(credentialsId: "${ENV_STAGE}", passwordVariable: 'ENV_PASSWORD', usernameVariable: 'USER')]){
+					if ("${DEPLOY_PASSWORD}" != "${ENV_PASSWORD}") {
+						currentBuild.result = 'FAILED'
+						error("Not Authorized for ${ENV_STAGE} Deployments.....")
+					} 
+				}
+			}
+		}
+	    }
+	}
+	
+        stage("InitializeGroovyScripts"){
+            steps {
+                script {
+                    if ("${buildResult}" != "SUCCESS") {
+                        currentBuild.result = 'ABORTED'
+                        error("Aborting the job.")
+                    }
+                    
+                    gvInfra=load "lib/commonInfraFunctions.groovy"
+                    jenkinsRoleArn = sh(script: "grep JENKINS_ROLE_ARN= ${config_file} | sed -e \"s/.*=//\"", returnStdout: true).trim()
+                }
+            }
+        }
+
+        stage("Build"){
+            steps {
+                script {
+                    dir("project"){
+                        checkout(
+                             [$class: 'GitSCM',
+                                branches: [[name: BRANCH_TO_BUILD]],
+                                doGenerateSubmoduleConfigurations: false,
+                                extensions: [[$class: 'PathRestriction', excludedRegions: SERVICE_NAME + '/.*pom.xml', includedRegions: SERVICE_NAME + '/.*']], 
+                                submoduleCfg: [],
+                                userRemoteConfigs: [[credentialsId: git_credential,
+                                url: GITREPO_TO_BUILD]]
+                            ])                             
+                    }
+                }
+            }
+        }
+
+        stage('HelmDryRunTest'){
+            steps {
+                script {
+                    def account_id = sh(script: "grep AWS_ACCOUNT_ID= ${config_file} | sed -e \"s/.*=//\"", returnStdout: true).trim()
+                    gvInfra.awsAuthentication(account_id, config_file, jenkinsRoleArn, false)
+                    dir("project"){
+						echo tag
+						if ("${tag}" == "DEFAULT"){
+							tag = sh (returnStdout: true, script: 'git describe --tags $(git rev-list --tags --max-count=1) | awk NF').trim()
+						}
+						def gitBaseUrl = "git@github.whirlpool.com:gpo-iot/"
+						def repoName = gitRepoFullURL.substring(gitBaseUrl.length(), (gitRepoFullURL.length())-4)
+						serviceVersion = tag.substring(repoName.length()+1)
+
+                        if (fileExists("./${SERVICE_NAME}/service-chart")){
+                            helmChart_releasename = sh (script: "grep ${SERVICE_NAME}= ../config/services-helm-releasemap.txt | sed -e \"s/.*=//\"", returnStdout: true).trim()
+                            if (fileExists("./${SERVICE_NAME}/service-chart/templates/secret.yaml")){
+                            	def copymsk = sh (script: "cp ../${msk_config_file} ./${SERVICE_NAME}/service-chart | sed -e \"s/.*=//\"", returnStdout: true).trim()
+                            	
+                            	gvInfra.deployHelmChart(SERVICE_NAME, "${SERVICE_NAME}/service-chart", "${SERVICE_NAME}/service-chart/values-${ENV_STAGE}.yaml","${SERVICE_NAME}/service-chart/values-key-${ENV_STAGE}.yaml", serviceVersion, ENV_STAGE, " --dry-run ", helmChart_releasename)
+                        	}
+                        	else{
+                        		gvInfra.deployHelmChart(SERVICE_NAME, "${SERVICE_NAME}/service-chart", "${SERVICE_NAME}/service-chart/values-${ENV_STAGE}.yaml","NA", serviceVersion, ENV_STAGE, " --dry-run ", helmChart_releasename)
+                        	}
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('HelmDeploy'){
+            steps {
+                script {
+                    dir("project"){
+                        if (fileExists("./${SERVICE_NAME}/service-chart")){
+                            if (fileExists("./${SERVICE_NAME}/service-chart/templates/secret.yaml")){
+                                def copymsk = sh (script: "cp ../${msk_config_file} ./${SERVICE_NAME}/service-chart | sed -e \"s/.*=//\"", returnStdout: true).trim()
+                                gvInfra.deployHelmChart(SERVICE_NAME, "${SERVICE_NAME}/service-chart", "${SERVICE_NAME}/service-chart/values-${ENV_STAGE}.yaml","${SERVICE_NAME}/service-chart/values-key-${ENV_STAGE}.yaml", serviceVersion, ENV_STAGE, "", helmChart_releasename)
+                            }
+                            else{
+                                gvInfra.deployHelmChart(SERVICE_NAME, "${SERVICE_NAME}/service-chart", "${SERVICE_NAME}/service-chart/values-${ENV_STAGE}.yaml","NA", serviceVersion, ENV_STAGE, "", helmChart_releasename)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+	stage('k8s-cw-adapter-deploy') {
+		when { expression { "wcloud-email-service-internal" == SERVICE_NAME && !dr_event }}
+		steps{
+		    script {
+			    region = gvInfra.readConfigParameter("AWS_REGION", config_file)
+			    account_id = gvInfra.readConfigParameter("AWS_ACCOUNT_ID", config_file)
+			    eks_cluster = gvInfra.readConfigParameter("EKS_CLUSTER_NAME", config_file)
+			    }
+			    sh """
+			    #!/bin/bash
+			    set +e
+			    export KUBECONFIG=\$(mktemp --suffix=.yml)
+			    touch \$KUBECONFIG
+			    # and make sure it gets cleaned up on exit
+			    function cleanupconfig {
+				rm -f \$KUBECONFIG
+			    }
+			    trap cleanupconfig EXIT
+			    echo ${aws_region}
+			    echo ${eks_cluster}
+			    aws --profile ${aws_profile} eks --region ${aws_region} update-kubeconfig --name ${eks_cluster}
+			    kubectl apply -f ./k8s-cloudwatch-adapter/k8scw-adapter.yaml
+
+		    """
+		    }
+	}
+	
+        stage('nlb') {
+            when { expression { "wcloud-email-service-internal" == SERVICE_NAME && !dr_event }}
+            steps {
+                script {
+                    nlb_stack_name = gvInfra.readConfigParameter("NLB_STACK_NAME", config_file)
+                    vpclink_stack_name = "${nlb_stack_name}-apilink"
+                    vpc_id =gvInfra.readConfigParameter("VPC_ID", config_file)
+                    subnets_nlb = gvInfra.readConfigParameter("SUBNETS_NLB", config_file)
+                    domain_suffix = gvInfra.readConfigParameter("ROUTE_53_DOMAIN_SUFFIX", config_file)
+                    ssm_key = gvInfra.readConfigParameter("CLUSTER_NLB_SSM_KEY", config_file)
+                    region = gvInfra.readConfigParameter("AWS_REGION", config_file)
+                    account_id = gvInfra.readConfigParameter("AWS_ACCOUNT_ID", config_file)
+                    eks_cluster = gvInfra.readConfigParameter("EKS_CLUSTER_NAME", config_file)
+                    stack_cmd = gvInfra.getStackCreateOrUpdateCMD(nlb_stack_name)
+                    vpclink_stack_cmd = gvInfra.getStackCreateOrUpdateCMD(vpclink_stack_name)
+                }
+                sh """
+                    #!/bin/bash
+                    set +e
+
+                    export KUBECONFIG=\$(mktemp --suffix=.yml)
+                    touch \$KUBECONFIG
+                    # and make sure it gets cleaned up on exit
+                    function cleanupconfig {
+                        rm -f \$KUBECONFIG
+                    }
+                    trap cleanupconfig EXIT
+                    aws --profile ${aws_profile} eks --region ${aws_region} update-kubeconfig --name ${eks_cluster}
+
+                    CLUSTER_NLB=\$(kubectl get ingress --kubeconfig \$KUBECONFIG -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
+                    echo \$CLUSTER_NLB
+                    SLEEP_COUNT=0
+                    COUNT_LIMIT=900
+                    while [[ ! "\$CLUSTER_NLB" =~ "amazonaws" ]] && [ "\$SLEEP_COUNT" -lt "\$COUNT_LIMIT" ];
+                    do
+                        sleep 10
+                        ((SLEEP_COUNT+=10))
+                        CLUSTER_NLB=\$(kubectl get ingress --kubeconfig \$KUBECONFIG -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
+                    done
+
+                    if [[ ! "\$CLUSTER_NLB" =~ "amazonaws" ]];
+                    then
+                        echo "Cluster NLB not created in allowed time"
+                        exit 1
+                    fi
+
+                    IFS='.' read -ra DOMAIN_PARTS <<< \${CLUSTER_NLB}
+
+                    IFS=- read -ra SUB_DOMAIN_PARTS <<< \${DOMAIN_PARTS[0]}
+
+                    CLUSTER_NLB_ARN="arn:aws:elasticloadbalancing:${region}:${account_id}:loadbalancer/net/\${SUB_DOMAIN_PARTS[0]}/\${SUB_DOMAIN_PARTS[1]}"
+
+                    read -ra IPS <<< \$(aws ec2 describe-network-interfaces \
+                    --filters Name=description,Values="ELB net/\${SUB_DOMAIN_PARTS[0]}/\${SUB_DOMAIN_PARTS[1]}" \
+                    --query 'NetworkInterfaces[*].PrivateIpAddresses[*].PrivateIpAddress' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    OPTIONAL_3RD_IP=\$(if [ \${IPS[2]+abc} ]; then echo "\${IPS[2]}"; else echo ""; fi)
+
+                    # envoke cfn command
+                    OUTPUT=\$(aws cloudformation ${stack_cmd} \
+                    --stack-name ${nlb_stack_name} --template-body file://nlb/nlb.yaml \
+                    --parameters ParameterKey=VPC,ParameterValue=${vpc_id} \
+                    'ParameterKey=Subnets,ParameterValue="${subnets_nlb}"' \
+                    ParameterKey=NLBTarget1,ParameterValue=\${IPS[0]} \
+                    ParameterKey=NLBTarget2,ParameterValue=\${IPS[1]} \
+                    ParameterKey=NLBTarget3,ParameterValue=\${OPTIONAL_3RD_IP} \
+                    ParameterKey=ClusterDomainName,ParameterValue=eks.${ENV_STAGE}${domain_suffix} \
+                    ParameterKey=WSDomainName,ParameterValue=ws.${ENV_STAGE}${domain_suffix} \
+                    ParameterKey=PortalDomainName,ParameterValue=portal.${ENV_STAGE}${domain_suffix} \
+                    ParameterKey=CLDomainName,ParameterValue=cl.${ENV_STAGE}${domain_suffix} \
+                    ParameterKey=MaytagDomainName,ParameterValue=maytag.${ENV_STAGE}${domain_suffix} \
+                    ParameterKey=AmazonOauthDomainName,ParameterValue=amazon.${ENV_STAGE}${domain_suffix} \
+                    ParameterKey=GoogleOauthDomainName,ParameterValue=google.${ENV_STAGE}${domain_suffix} \
+		    ParameterKey=EmeaGoogleOauthDomainName,ParameterValue=emeagoogle.${ENV_STAGE}${domain_suffix} \
+		    ParameterKey=s2cPortalDomainName,ParameterValue=s2cportal.${ENV_STAGE}${domain_suffix} \
+                    ParameterKey=ClusterNLB,ParameterValue=\${CLUSTER_NLB} \
+                    --profile ${aws_profile} 2>&1)
+
+                    EXIT_CODE=\$?
+                    if [[ \$OUTPUT == *"${update_no_change}"* ]]; then
+                        echo \$OUTPUT
+                    elif [ "\$EXIT_CODE" -ne 0 ]; then
+                        echo \$OUTPUT
+                        exit 1
+                    fi
+
+                    STACK_STATUS=\$(aws cloudformation describe-stacks \
+                    --stack-name ${nlb_stack_name} \
+                    --query 'Stacks[0].StackStatus' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    if [[ "\$STACK_STATUS" == *"COMPLETE"* ]]; then
+                        echo "NLB already complete"
+                    elif [[ "\$STACK_STATUS" == *"UPDATE"* ]]; then
+                        aws cloudformation wait stack-update-complete --profile ${aws_profile} --stack-name ${nlb_stack_name}
+                    elif [[ "\$STACK_STATUS" == *"CREATE"* ]]; then
+                        aws cloudformation wait stack-create-complete --profile ${aws_profile} --stack-name ${nlb_stack_name}
+                    fi
+
+                    OUTPUT=\$(aws cloudformation ${vpclink_stack_cmd} \
+                    --stack-name ${vpclink_stack_name} --template-body file://vpclink/vpclink.yaml \
+                    --parameters ParameterKey=ClusterNLBArn,ParameterValue=\${CLUSTER_NLB_ARN} \
+                    --role-arn arn:aws:iam::${account_id}:role/iot-cf-automation-role \
+                    --profile ${aws_profile} 2>&1)
+
+                    EXIT_CODE=\$?
+                    if [[ \$OUTPUT == *"${update_no_change}"* ]]; then
+                        echo \$OUTPUT
+                    elif [ "\$EXIT_CODE" -ne 0 ]; then
+                        echo \$OUTPUT
+                        exit 1
+                    fi
+
+                    STACK_STATUS=\$(aws cloudformation describe-stacks \
+                    --stack-name ${vpclink_stack_name} \
+                    --query 'Stacks[0].StackStatus' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    if [[ "\$STACK_STATUS" == *"COMPLETE"*  ]]; then
+                        echo "NLB already complete"
+                    elif [[ "\$STACK_STATUS" == *"UPDATE"*  ]]; then
+                        aws cloudformation wait stack-update-complete --profile ${aws_profile} --stack-name ${vpclink_stack_name}
+                    elif [[ "\$STACK_STATUS" == *"CREATE"*  ]]; then
+                        aws cloudformation wait stack-create-complete --profile ${aws_profile} --stack-name ${vpclink_stack_name}
+                    fi
+                """
+            }
+        }
+
+        stage('nlb-dr') {
+            when { expression { "wcloud-email-service-internal" == SERVICE_NAME && dr_event }}
+            steps {
+                script {
+                    nlb_stack_name = gvInfra.readConfigParameter("NLB_STACK_NAME", config_file)
+                    vpclink_stack_name = "${nlb_stack_name}-apilink"
+                    vpc_id =gvInfra.readConfigParameter("VPC_ID", config_file)
+                    subnets_nlb = gvInfra.readConfigParameter("SUBNETS_NLB", config_file)
+                    domain_suffix = gvInfra.readConfigParameter("ROUTE_53_DOMAIN_SUFFIX", config_file)
+                    ssm_key = gvInfra.readConfigParameter("CLUSTER_NLB_SSM_KEY", config_file)
+                    region = gvInfra.readConfigParameter("AWS_REGION", config_file)
+                    account_id = gvInfra.readConfigParameter("AWS_ACCOUNT_ID", config_file)
+                    eks_cluster = gvInfra.readConfigParameter("EKS_CLUSTER_NAME", config_file)
+                    stack_cmd = gvInfra.getStackCreateOrUpdateCMD(nlb_stack_name)
+                    vpclink_stack_cmd = gvInfra.getStackCreateOrUpdateCMD(vpclink_stack_name)
+                }
+                sh """
+                    #!/bin/bash
+                    set +e
+
+                    export KUBECONFIG=\$(mktemp --suffix=.yml)
+                    touch \$KUBECONFIG
+                    # and make sure it gets cleaned up on exit
+                    function cleanupconfig {
+                        rm -f \$KUBECONFIG
+                    }
+                    trap cleanupconfig EXIT
+                    aws --profile ${aws_profile} eks --region ${aws_region} update-kubeconfig --name ${eks_cluster}
+
+                    CLUSTER_NLB=\$(kubectl get ingress --kubeconfig \$KUBECONFIG -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
+                    echo \$CLUSTER_NLB
+                    SLEEP_COUNT=0
+                    COUNT_LIMIT=900
+                    while [[ ! "\$CLUSTER_NLB" =~ "amazonaws" ]] && [ "\$SLEEP_COUNT" -lt "\$COUNT_LIMIT" ];
+                    do
+                        sleep 10
+                        ((SLEEP_COUNT+=10))
+                        CLUSTER_NLB=\$(kubectl get ingress --kubeconfig \$KUBECONFIG -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
+                    done
+
+                    if [[ ! "\$CLUSTER_NLB" =~ "amazonaws" ]];
+                    then
+                        echo "Cluster NLB not created in allowed time"
+                        exit 1
+                    fi
+
+                    IFS='.' read -ra DOMAIN_PARTS <<< \${CLUSTER_NLB}
+
+                    IFS=- read -ra SUB_DOMAIN_PARTS <<< \${DOMAIN_PARTS[0]}
+
+                    CLUSTER_NLB_ARN="arn:aws:elasticloadbalancing:${region}:${account_id}:loadbalancer/net/\${SUB_DOMAIN_PARTS[0]}/\${SUB_DOMAIN_PARTS[1]}"
+
+                    read -ra IPS <<< \$(aws ec2 describe-network-interfaces \
+                    --filters Name=description,Values="ELB net/\${SUB_DOMAIN_PARTS[0]}/\${SUB_DOMAIN_PARTS[1]}" \
+                    --query 'NetworkInterfaces[*].PrivateIpAddresses[*].PrivateIpAddress' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    OPTIONAL_3RD_IP=\$(if [ \${IPS[2]+abc} ]; then echo "\${IPS[2]}"; else echo ""; fi)
+
+                    # envoke cfn command
+                    OUTPUT=\$(aws cloudformation ${stack_cmd} \
+                    --stack-name ${nlb_stack_name} --template-body file://nlb/nlb-dr.yaml \
+                    --parameters ParameterKey=VPC,ParameterValue=${vpc_id} \
+                    'ParameterKey=Subnets,ParameterValue="${subnets_nlb}"' \
+                    ParameterKey=NLBTarget1,ParameterValue=\${IPS[0]} \
+                    ParameterKey=NLBTarget2,ParameterValue=\${IPS[1]} \
+                    ParameterKey=NLBTarget3,ParameterValue=\${OPTIONAL_3RD_IP} \
+                    ParameterKey=ClusterNLB,ParameterValue=\${CLUSTER_NLB} \
+                    --profile ${aws_profile} 2>&1)
+
+                    EXIT_CODE=\$?
+                    if [[ \$OUTPUT == *"${update_no_change}"* ]]; then
+                        echo \$OUTPUT
+                    elif [ "\$EXIT_CODE" -ne 0 ]; then
+                        echo \$OUTPUT
+                        exit 1
+                    fi
+
+                    STACK_STATUS=\$(aws cloudformation describe-stacks \
+                    --stack-name ${nlb_stack_name} \
+                    --query 'Stacks[0].StackStatus' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    if [[ "\$STACK_STATUS" == *"COMPLETE"* ]]; then
+                        echo "NLB already complete"
+                    elif [[ "\$STACK_STATUS" == *"UPDATE"* ]]; then
+                        aws cloudformation wait stack-update-complete --profile ${aws_profile} --stack-name ${nlb_stack_name}
+                    elif [[ "\$STACK_STATUS" == *"CREATE"* ]]; then
+                        aws cloudformation wait stack-create-complete --profile ${aws_profile} --stack-name ${nlb_stack_name}
+                    fi
+
+                    OUTPUT=\$(aws cloudformation ${vpclink_stack_cmd} \
+                    --stack-name ${vpclink_stack_name} --template-body file://vpclink/vpclink.yaml \
+                    --parameters ParameterKey=ClusterNLBArn,ParameterValue=\$CLUSTER_NLB_ARN \
+                    --profile ${aws_profile} 2>&1)
+
+                    EXIT_CODE=\$?
+                    if [[ \$OUTPUT == *"${update_no_change}"* ]]; then
+                        echo \$OUTPUT
+                    elif [ "\$EXIT_CODE" -ne 0 ]; then
+                        echo \$OUTPUT
+                        exit 1
+                    fi
+
+                    STACK_STATUS=\$(aws cloudformation describe-stacks \
+                    --stack-name ${vpclink_stack_name} \
+                    --query 'Stacks[0].StackStatus' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    if [[ "\$STACK_STATUS" == *"COMPLETE"* ]]; then
+                        echo "NLB already complete"
+                    elif [[ "\$STACK_STATUS" == *"UPDATE"* ]]; then
+                        aws cloudformation wait stack-update-complete --profile ${aws_profile} --stack-name ${vpclink_stack_name}
+                    elif [[ "\$STACK_STATUS" == *"CREATE"* ]]; then
+                        aws cloudformation wait stack-create-complete --profile ${aws_profile} --stack-name ${vpclink_stack_name}
+                    fi
+                """
+            }
+        }
+
+        stage('apigateway') {
+            when { expression { "wcloud-email-service-internal" == SERVICE_NAME } }
+            steps {
+                script {
+                    apigateway_stack_name=gvInfra.readConfigParameter("APIGATEWAY_STACK_NAME", config_file)
+                    api_name=gvInfra.readConfigParameter("API_NAME", config_file)
+                    region = gvInfra.readConfigParameter("AWS_REGION", config_file)
+                    account_id = gvInfra.readConfigParameter("AWS_ACCOUNT_ID", config_file)
+                    eks_cluster = gvInfra.readConfigParameter("EKS_CLUSTER_NAME", config_file)
+                    env = gvInfra.readConfigParameter("ENVIRONMENT", config_file)
+                    stage = gvInfra.readConfigParameter("APIGATEWAY_ENV", config_file)
+                    cert_arn = gvInfra.readConfigParameter("APIGATEWAY_CERT", config_file)
+                    domain_name = gvInfra.readConfigParameter("APIGATEWAY_DOMAIN_NAME", config_file)
+		    lambda_function_arn = gvInfra.readConfigParameter("LAMBDA_FUNCTION_ARN", config_file)
+                    
+                    apigateway_portal_stack_name="${apigateway_stack_name}-portal"
+                    portal_api_name="${api_name}-portal"
+                    portal_cert_arn = gvInfra.readConfigParameter("APIGATEWAY_PORTAL_CERT", config_file)
+                    portal_domain_name = gvInfra.readConfigParameter("APIGATEWAY_PORTAL_DOMAIN_NAME", config_file)
+		    apigw_bucket_name = gvInfra.readConfigParameter("APIGW_BUCKET_NAME", config_file)
+                    
+                    stack_cmd=gvInfra.getStackCreateOrUpdateCMD(apigateway_stack_name)
+                    portal_stack_cmd=gvInfra.getStackCreateOrUpdateCMD(apigateway_portal_stack_name)
+                }
+                sh """
+                    #!/bin/bash
+                    set +e
+
+                    export KUBECONFIG=\$(mktemp --suffix=.yml)
+                    touch \$KUBECONFIG
+                    # and make sure it gets cleaned up on exit
+                    function cleanupconfig {
+                        rm -f \$KUBECONFIG
+                    }
+                    trap cleanupconfig EXIT
+                    aws --profile ${aws_profile} eks --region ${aws_region} update-kubeconfig --name ${eks_cluster}
+
+                    CLUSTER_NLB=\$(kubectl get ingress --kubeconfig \$KUBECONFIG -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
+
+                    IFS='.' read -ra DOMAIN_PARTS <<< \${CLUSTER_NLB}
+
+                    IFS=- read -ra SUB_DOMAIN_PARTS <<< \${DOMAIN_PARTS}
+
+                    CLUSTER_NLB_ARN="arn:aws:elasticloadbalancing:${region}:${account_id}:loadbalancer/net/\${SUB_DOMAIN_PARTS[0]}/\${SUB_DOMAIN_PARTS[1]}"
+
+                    BUCKET=\$(aws cloudformation list-exports \
+                    --query 'Exports[?Name==`CodePipelineRootBucket`].Value' \
+                    --output text \
+                    --profile ${aws_profile})
+                    
+                    aws s3 cp ./apigateway/apigw.yaml s3://\${BUCKET}/apigateway/apigw.yaml --profile ${aws_profile}
+
+                    # envoke cfn command
+                    OUTPUT=\$(aws cloudformation ${stack_cmd} \
+                    --stack-name ${apigateway_stack_name} --template-url https://\${BUCKET}.s3.${region}.amazonaws.com/apigateway/apigw.yaml \
+                    --parameters ParameterKey=APIName,ParameterValue=${api_name} \
+                    ParameterKey=CertArn,ParameterValue=${cert_arn} \
+                    ParameterKey=DomainName,ParameterValue=${domain_name} \
+                    ParameterKey=StageName,ParameterValue=${stage} \
+                    ParameterKey=Env,ParameterValue=${env} \
+                    ParameterKey=ClusterNLBArn,ParameterValue=\${CLUSTER_NLB_ARN} \
+		    ParameterKey=LambdaFunctionArn,ParameterValue=${lambda_function_arn} \
+                    --capabilities CAPABILITY_NAMED_IAM \
+                    --profile ${aws_profile} 2>&1)
+
+                    EXIT_CODE=\$?
+                    if [[ \$OUTPUT == *"${update_no_change}"* ]]; then
+                        echo \$OUTPUT
+                    elif [ "\$EXIT_CODE" -ne 0 ]; then
+                        echo \$OUTPUT
+                        exit 1
+                    fi
+
+                    STACK_STATUS=\$(aws cloudformation describe-stacks \
+                    --stack-name ${apigateway_stack_name} \
+                    --query 'Stacks[0].StackStatus' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    if [[ "\$STACK_STATUS" == *"COMPLETE"*  ]]; then
+                        echo "API Gateway already complete"
+                    elif [[ "\$STACK_STATUS" == *"UPDATE"*  ]]; then
+                        aws cloudformation wait stack-update-complete --profile ${aws_profile} --stack-name ${apigateway_stack_name}
+                    elif [[ "\$STACK_STATUS" == *"CREATE"*  ]]; then
+                        aws cloudformation wait stack-create-complete --profile ${aws_profile} --stack-name ${apigateway_stack_name}
+                    fi
+
+                    STAGE=\$(aws cloudformation describe-stacks \
+                    --stack-name ${apigateway_stack_name} \
+                    --query 'Stacks[0].Outputs[?OutputKey==`Stage`].OutputValue' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    MAIN_API_ID=\$(aws cloudformation describe-stacks \
+                    --stack-name ${apigateway_stack_name} \
+                    --query 'Stacks[0].Outputs[?OutputKey==`RestAPI`].OutputValue' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    OAUTH_API_ID=\$(aws cloudformation describe-stacks \
+                    --stack-name ${apigateway_stack_name} \
+                    --query 'Stacks[0].Outputs[?OutputKey==`RestAPIOAuthYummly`].OutputValue' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    EMAIL_CONF_API_ID=\$(aws cloudformation describe-stacks \
+                    --stack-name ${apigateway_stack_name} \
+                    --query 'Stacks[0].Outputs[?OutputKey==`RestAPIConfirmation`].OutputValue' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    WRAPPER_API_ID=\$(aws cloudformation describe-stacks \
+                    --stack-name ${apigateway_stack_name} \
+                    --query 'Stacks[0].Outputs[?OutputKey==`RestAPIWrapper`].OutputValue' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    aws apigateway create-deployment --rest-api-id \${MAIN_API_ID} --stage-name \${STAGE} --profile ${aws_profile}
+                    sleep 5s
+                    aws apigateway create-deployment --rest-api-id \${OAUTH_API_ID} --stage-name \${STAGE} --profile ${aws_profile}
+                    sleep 5s
+                    aws apigateway create-deployment --rest-api-id \${EMAIL_CONF_API_ID} --stage-name \${STAGE} --profile ${aws_profile}
+                    sleep 5s
+                    aws apigateway create-deployment --rest-api-id \${WRAPPER_API_ID} --stage-name \${STAGE} --profile ${aws_profile}
+		    
+		    aws s3 cp ./apigateway/portal-apigw.yaml s3://\${BUCKET}/apigateway/portal-apigw.yaml --profile ${aws_profile}
+		    
+		    cd ./apigateway
+
+		    if [[ \$ENV_STAGE == *"qa"* ]]; then
+                        sed -i 's/envar/qa/g' portal-apigw-body-12.json
+			sed -i 's/VpcLink/5g2sey/g' portal-apigw-body-12.json
+                    elif [[ \$ENV_STAGE != *"qa"* ]]; then
+                        echo "not-qa-enviroment"
+                    fi
+
+		    aws s3 cp ./portal-apigw-body-12.json s3://\${BUCKET}/apigateway/portal-apigw-body-12.json --profile ${aws_profile}
+
+                    # envoke cfn command
+                    OUTPUT=\$(aws cloudformation ${portal_stack_cmd} \
+                    --stack-name ${apigateway_portal_stack_name} --template-url https://\${BUCKET}.s3.${region}.amazonaws.com/apigateway/portal-apigw.yaml \
+                    --parameters ParameterKey=APIName,ParameterValue=${portal_api_name} \
+                    ParameterKey=CertArn,ParameterValue=${portal_cert_arn} \
+                    ParameterKey=DomainName,ParameterValue=${portal_domain_name} \
+                    ParameterKey=StageName,ParameterValue=${stage} \
+                    ParameterKey=Env,ParameterValue=${env} \
+                    ParameterKey=ClusterNLBArn,ParameterValue=\${CLUSTER_NLB_ARN} \
+		    ParameterKey=Bucket,ParameterValue=${apigw_bucket_name} \
+                    --capabilities CAPABILITY_NAMED_IAM \
+                    --profile ${aws_profile} 2>&1)
+
+                    EXIT_CODE=\$?
+                    if [[ \$OUTPUT == *"${update_no_change}"* ]]; then
+                        echo \$OUTPUT
+                    elif [ "\$EXIT_CODE" -ne 0 ]; then
+                        echo \$OUTPUT
+                        exit 1
+                    fi
+
+                    STACK_STATUS=\$(aws cloudformation describe-stacks \
+                    --stack-name ${apigateway_portal_stack_name} \
+                    --query 'Stacks[0].StackStatus' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    if [[ "\$STACK_STATUS" == *"COMPLETE"* ]]; then
+                        echo "API Gateway already complete"
+                    elif [[ "\$STACK_STATUS" == *"UPDATE"* ]]; then
+                        aws cloudformation wait stack-update-complete --profile ${aws_profile} --stack-name ${apigateway_portal_stack_name}
+                    elif [[ "\$STACK_STATUS" == *"CREATE"* ]]; then
+                        aws cloudformation wait stack-create-complete --profile ${aws_profile} --stack-name ${apigateway_portal_stack_name}
+                    fi
+
+                    STAGE=\$(aws cloudformation describe-stacks \
+                    --stack-name ${apigateway_portal_stack_name} \
+                    --query 'Stacks[0].Outputs[?OutputKey==`Stage`].OutputValue' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    MAIN_API_ID=\$(aws cloudformation describe-stacks \
+                    --stack-name ${apigateway_portal_stack_name} \
+                    --query 'Stacks[0].Outputs[?OutputKey==`RestAPI`].OutputValue' \
+                    --output text \
+                    --profile ${aws_profile})
+                    
+                    SAID_API_ID=\$(aws cloudformation describe-stacks \
+                    --stack-name ${apigateway_portal_stack_name} \
+                    --query 'Stacks[0].Outputs[?OutputKey==`RestAPISAID`].OutputValue' \
+                    --output text \
+                    --profile ${aws_profile})
+
+                    aws apigateway create-deployment --rest-api-id \${MAIN_API_ID} --stage-name \${STAGE} --profile ${aws_profile}
+                    sleep 5s
+                    aws apigateway create-deployment --rest-api-id \${SAID_API_ID} --stage-name \${STAGE} --profile ${aws_profile}
+                """
+            }
+        }
+    }
+    post {
+        failure {
+          emailext attachLog: true, body: '''$PROJECT_NAME - $SERVICE_NAME# $BUILD_NUMBER - $BUILD_STATUS:
+          Check console output at $BUILD_URL to view the results.''',
+          postsendScript: '$DEFAULT_POSTSEND_SCRIPT',
+          presendScript: '$DEFAULT_PRESEND_SCRIPT',
+          replyTo: 'noreply@whirlpool.com',
+          subject: '$PROJECT_NAME - $SERVICE_NAME# $BUILD_NUMBER - $BUILD_STATUS!',
+          to: '$P_RECIPIENT_LIST'
+        }
+    }
+}
